@@ -830,7 +830,20 @@ def main():
 
     trade_days = [d.date() for d in prices["2330"].index]
     last_day = trade_days[-1]
-    is_new_day = last_day == dt.datetime.now(TW).date()
+    today_tw = dt.datetime.now(TW).date()
+
+    # 以證交所當日全市場資料確認今天是否為交易日。
+    # Yahoo Finance 的台股日 K 有時盤後較晚更新；若 Yahoo 還停在前一交易日，
+    # 不應把舊資料當成今天的盤後報告推播。
+    twse_rows = get_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
+    twse_has_today = any(
+        str(row.get("Code", "")) == "2330" and str(row.get("ClosingPrice", "")).strip()
+        for row in twse_rows
+    )
+    is_new_day = last_day == today_tw
+    stale_market_data = twse_has_today and last_day < today_tw
+    if stale_market_data:
+        print(f"⚠️ 證交所已有 {today_tw} 當日資料，但 Yahoo Finance 最新日 K 仍為 {last_day}；本次只更新網站，不推 LINE。")
 
     hist = get_chip_history(trade_days[-CHIP_DAYS:])
     today_chips = hist[-1]
@@ -976,6 +989,10 @@ def main():
             b.write(a.read())
     print(f"網站資料：{len(details)} 檔；名單 糾結 {len(lists['tangle'])}、一般 {len(lists['general'])}、拉回 {len(lists['pullback'])}")
 
+    # FORCE 只允許在休市日重跑「最近交易日」資料；若證交所已進入新交易日但
+    # Yahoo Finance 尚未更新，手動 Run workflow 也禁止把舊資料推成今日盤後報告。
+    if stale_market_data:
+        return
     if not is_new_day and os.getenv("FORCE") != "true":
         print("今天沒有新資料（可能休市），只更新網站，不推 LINE")
         return
