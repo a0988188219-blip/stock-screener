@@ -33,6 +33,9 @@ RSI_HOT = 80                 # RSI 超過算過熱，不列入
 LIST_N = 5                   # 每份名單最多幾檔
 MTF_MIN_SCORE = 50           # 日/週/月多週期技術分數最低門檻（100分）
 TREND_VOL = 1.2              # 非突破型趨勢轉強，至少要有 1.2 倍量
+STRONG_VOL = 1.5             # 強勢續攻近期至少要有明顯放量
+RR_FORMAL_MIN = 1.5          # 正式做多名單最低報酬風險比
+RR_WATCH_MIN = 1.0           # 低於 1.0 不列推薦；1.0~1.49 列觀察
 CHIP_DAYS = 10
 THEMES_FILE = "themes.csv"
 # =======================================================
@@ -670,6 +673,44 @@ def detect_trend_setup(df, I, support):
             "days": 20, "top": close, "bot": float(support or ma20), "rng": r2(bias)}
 
 
+def detect_strong_continuation(df, I, support):
+    """抓已經啟動、但多頭結構仍完整的強勢續攻股。"""
+    if len(df) < 65:
+        return None
+    c = df["Close"]
+    close = float(c.iloc[-1])
+    ma20 = float(I["ma20"].iloc[-1])
+    ma60 = float(I["ma60"].iloc[-1])
+    rsi = float(I["rsi"].iloc[-1])
+    bias = (close / ma20 - 1) * 100
+    ret3 = (close / float(c.iloc[-4]) - 1) * 100
+    hi20_prev = float(df["High"].iloc[-21:-1].max())
+    near_high = close >= hi20_prev * 0.97
+
+    recent_vr = 0.0
+    for i in range(-3, 0):
+        base = float(I["vma20"].iloc[i - 1]) if I["vma20"].iloc[i - 1] == I["vma20"].iloc[i - 1] else 0
+        if base > 0:
+            recent_vr = max(recent_vr, float(df["Volume"].iloc[i] / base))
+
+    if not (close > ma20 > ma60):
+        return None
+    if not (I["ma20"].iloc[-1] > I["ma20"].iloc[-6]):
+        return None
+    if not near_high or ret3 < 4:
+        return None
+    if recent_vr < STRONG_VOL:
+        return None
+    if not (58 <= rsi <= 85):
+        return None
+    if bias > 18:
+        return None
+
+    return {"kind": "strong", "vr": recent_vr, "day": 1,
+            "days": 20, "top": hi20_prev,
+            "bot": float(support or ma20), "rng": r2(bias), "ret3": r2(ret3)}
+
+
 # ---------------- 型態判斷 ----------------
 def find_box(df, e):
     """第 e 天之前的盤整箱型（找整理最久的）"""
@@ -752,11 +793,15 @@ def tech_items_pick(pat, I, ms, rsi):
     elif k == "trend":
         it.append(item("good", "型態", "日線剛轉強、量能開始放大，尚未明顯噴遠"))
         pts += 2
+    elif k == "strong":
+        it.append(item("good", "型態", f"強勢續攻，近3日約 {pat.get('ret3', 0):.1f}% 且量能放大"))
+        pts += 3
     else:
         it.append(item("good", "型態", "多頭趨勢中拉回支撐，量縮止跌"))
         pts += 3
     if k != "pullback":
-        it.append(item("good" if pat["vr"] >= 2 else "info", "量能", f"突破當天 {pat['vr']:.1f} 倍量"))
+        vol_label = "近期最大" if k in ("trend", "strong") else "突破當天"
+        it.append(item("good" if pat["vr"] >= 2 else "info", "量能", f"{vol_label} {pat['vr']:.1f} 倍量"))
         pts += 1 if pat["vr"] >= 2 else 0
     if ms["zero"]:
         it.append(item("good", "MACD", "零軸附近黃金交叉，起漲訊號")); pts += 2
@@ -959,6 +1004,18 @@ def make_plan(pat, close, support, resistance, df):
             target, tnote = resistance, "前波壓力"
         else:
             target, tnote = close * 1.10, "現價 +10%"
+    elif pat["kind"] == "strong":
+        base = support or float(df["Close"].rolling(20).mean().iloc[-1])
+        # 強勢股不鼓勵追高，進場區放在現價下方回測區。
+        lo = max(base, close * 0.94)
+        hi = min(close * 0.98, max(lo, base * 1.02))
+        if hi < lo:
+            hi = lo * 1.02
+        stop = base * 0.97
+        if resistance and resistance > close * 1.04:
+            target, tnote = resistance, "前波壓力"
+        else:
+            target, tnote = close * 1.12, "強勢波段 +12%"
     else:
         top, bot = pat["top"], pat["bot"]
         lo, hi = top, top * 1.02
@@ -1025,7 +1082,7 @@ def rotation(prices, last_day, funds, themes, today_chips):
 FICON = {"good": "✅", "neutral": "➖", "bad": "⚠️"}
 VICON = {"hold": "✅", "watch": "⚠️", "exit": "🚨"}
 VWORD = {"hold": "續抱", "watch": "留意", "exit": "該檢討"}
-KIND = {"tangle": "🔥", "box": "🚀", "high20": "🚀", "pullback": "🔄", "trend": "📈"}
+KIND = {"tangle": "🔥", "box": "🚀", "high20": "🚀", "pullback": "🔄", "trend": "📈", "strong": "🚀"}
 
 
 def facets_line(fc):
@@ -1044,7 +1101,7 @@ def pick_text(n, p):
     th = "、".join(d.get("themes", [])[:2]) or d.get("industry") or ""
     L = [f"{n}. {KIND[p['kind']]}{p['code']} {d['name']}｜{th}"]
     sub = ""
-    if p["kind"] not in ("pullback", "trend"):
+    if p["kind"] not in ("pullback", "trend", "strong"):
         sub = f"　突破第 {p['day']} 天"
     L.append(f"收 {d['close']:,.2f}（{d['chg']:+.1f}%）{sub}")
     mtf = d.get("mtf") or {}
@@ -1100,9 +1157,11 @@ def build_report(day, rot, lists, holdings=None, outflow_names=()):
         msgs.append("\n".join(H))
 
     titles = {"tangle": "🔥 起漲前段（均線糾結／箱型帶量剛突破）",
+              "strong": "🚀 強勢續攻（已啟動但多頭結構仍完整）",
               "general": "📈 做多機會（突破／趨勢剛轉強）",
-              "pullback": "🔄 多頭拉回再起（量縮守支撐）"}
-    for key in ("tangle", "general", "pullback"):
+              "pullback": "🔄 多頭拉回再起（量縮守支撐）",
+              "watch": "👀 偏多觀察（方向不差，但報酬風險比未達正式名單）"}
+    for key in ("tangle", "strong", "general", "pullback", "watch"):
         items = lists[key]
         T = [titles[key], ""]
         if not items:
@@ -1119,11 +1178,17 @@ def send_line(texts):
     if not token or not uid:
         print("\n\n=====\n\n".join(texts))
         return
-    r = requests.post("https://api.line.me/v2/bot/message/push",
-                      headers={"Authorization": f"Bearer {token}"},
-                      json={"to": uid, "messages": [{"type": "text", "text": t} for t in texts[:5]]},
-                      timeout=30)
-    print("LINE 回應：", r.status_code, r.text[:200])
+    # LINE 單次最多 5 則訊息；超過時分批送，避免新名單被截掉。
+    for i in range(0, len(texts), 5):
+        batch = texts[i:i + 5]
+        r = requests.post("https://api.line.me/v2/bot/message/push",
+                          headers={"Authorization": f"Bearer {token}"},
+                          json={"to": uid, "messages": [{"type": "text", "text": t} for t in batch]},
+                          timeout=30)
+        print(f"LINE 回應 第 {i // 5 + 1} 批：", r.status_code, r.text[:200])
+        if r.status_code >= 300:
+            break
+        time.sleep(1)
 
 
 # ---------------- 主程式 ----------------
@@ -1241,6 +1306,8 @@ def main():
                 if rsi > RSI_HOT or bias > MAX_BIAS or rise > limit:
                     pat = None
             if not pat:
+                pat = detect_strong_continuation(df, I, support)
+            if not pat:
                 pat = detect_pullback(df, I, support)
             if not pat:
                 pat = detect_trend_setup(df, I, support)
@@ -1254,20 +1321,36 @@ def main():
         except Exception as e:
             print(code, "分析失敗：", e)
 
-    # 名單排序（四面加總）
-    lists = {"tangle": [], "general": [], "pullback": []}
+    # 名單排序：技術面主導，再用籌碼、基本面與報酬風險比分類。
+    lists = {"tangle": [], "strong": [], "general": [], "pullback": [], "watch": []}
     for code, pat, tpi, tpts in cands:
         d = details[code]
-        # 技術面為主：多週期技術分數占最大權重；籌碼其次；基本面只做輔助。
         tech_score = d["mtf"]["total"] * 0.70 + tpts * 2.0
         chip_score = facet_pts(d["facets"]["chip"]["items"]) * 3.0
         fund_score = facet_pts(d["facets"]["fund"]["items"]) * 1.0
         score = tech_score + chip_score + fund_score
-        key = "tangle" if pat["kind"] == "tangle" else "pullback" if pat["kind"] == "pullback" else "general"
+
+        plan = make_plan(pat, d["close"], d["support"], d["resistance"], prices[code])
+        rr = plan.get("rr")
+        if rr is None or rr < RR_WATCH_MIN:
+            continue
+
+        if rr < RR_FORMAL_MIN:
+            key = "watch"
+        elif pat["kind"] == "strong":
+            key = "strong"
+        elif pat["kind"] == "tangle":
+            key = "tangle"
+        elif pat["kind"] == "pullback":
+            key = "pullback"
+        else:
+            key = "general"
+
         lists[key].append({"code": code, "kind": pat["kind"], "day": pat.get("day"),
-                           "score": round(score, 1), "pat": pat, "tpi": tpi})
+                           "score": round(score, 1), "pat": pat, "tpi": tpi, "plan": plan})
+
     for key in lists:
-        lists[key].sort(key=lambda p: (-p["score"], -p["pat"]["vr"] if key != "pullback" else p["pat"]["vr"]))
+        lists[key].sort(key=lambda p: (-p["score"], -(p["plan"].get("rr") or 0)))
         lists[key] = lists[key][:LIST_N]
 
     # 名單股＋持股抓新聞
@@ -1284,7 +1367,7 @@ def main():
         for p in lists[key]:
             d = details[p["code"]]
             df = prices[p["code"]]
-            d["plan"] = make_plan(p["pat"], d["close"], d["support"], d["resistance"], df)
+            d["plan"] = p.get("plan") or make_plan(p["pat"], d["close"], d["support"], d["resistance"], df)
             d["pick"] = {"list": key, "kind": p["kind"], "day": p["day"], "score": p["score"]}
             d["facets"]["tech"] = facet(p["tpi"])
             p["detail"] = d
@@ -1316,7 +1399,7 @@ def main():
     if os.path.exists("index.html"):
         with open("index.html", encoding="utf-8") as a, open("site/index.html", "w", encoding="utf-8") as b:
             b.write(a.read())
-    print(f"網站資料：{len(details)} 檔；名單 起漲 {len(lists['tangle'])}、做多 {len(lists['general'])}、拉回 {len(lists['pullback'])}")
+    print(f"網站資料：{len(details)} 檔；名單 起漲 {len(lists['tangle'])}、強勢 {len(lists['strong'])}、做多 {len(lists['general'])}、拉回 {len(lists['pullback'])}、觀察 {len(lists['watch'])}")
 
     # FORCE 只允許在休市日重跑「最近交易日」資料；若證交所已進入新交易日但
     # Yahoo Finance 尚未更新，手動 Run workflow 也禁止把舊資料推成今日盤後報告。
