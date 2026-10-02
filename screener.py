@@ -105,30 +105,92 @@ def get_universe():
 
 
 def get_twse_latest_ohlcv(target_day):
-    """取得證交所最新交易日的上市股票 OHLCV，供 Yahoo 少最後一天時補齊。"""
-    rows = get_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
+    """依指定日期取得證交所全部上市股票 OHLCV，不使用『最新資料』端點。"""
+    date_str = target_day.strftime("%Y%m%d")
+    url = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date_str}&type=ALLBUT0999&response=json"
+    try:
+        j = requests.get(url, headers=HEADERS, timeout=40).json()
+    except Exception as e:
+        print(f"{target_day} 指定日期行情抓取失敗：", e)
+        return {}
+
+    if str(j.get("stat", "")).upper() not in ("OK", ""):
+        print(f"{target_day} 證交所行情狀態異常：", j.get("stat"))
+        return {}
+
+    candidates = []
+    if isinstance(j.get("tables"), list):
+        candidates.extend(j["tables"])
+
+    # 相容舊格式
+    for n in range(1, 20):
+        f = j.get(f"fields{n}")
+        d = j.get(f"data{n}")
+        if isinstance(f, list) and isinstance(d, list):
+            candidates.append({"fields": f, "data": d})
+
+    wanted = None
+    for table in candidates:
+        fields = table.get("fields") or []
+        data = table.get("data") or []
+        if not fields or not data:
+            continue
+        joined = "|".join(str(x) for x in fields)
+        if "證券代號" in joined and "開盤價" in joined and "最高價" in joined and "最低價" in joined and "收盤價" in joined:
+            wanted = (fields, data)
+            break
+
+    if not wanted:
+        print(f"{target_day} 找不到證交所個股 OHLC 表格")
+        return {}
+
+    fields, data = wanted
+
+    def col(name):
+        for i, x in enumerate(fields):
+            if name in str(x):
+                return i
+        return None
+
+    i_code = col("證券代號")
+    i_open = col("開盤價")
+    i_high = col("最高價")
+    i_low = col("最低價")
+    i_close = col("收盤價")
+    i_vol = col("成交股數")
+    if None in (i_code, i_open, i_high, i_low, i_close, i_vol):
+        print(f"{target_day} 證交所欄位不完整：", fields)
+        return {}
+
     out = {}
-    for row in rows:
-        code = str(row.get("Code", "")).strip()
-        if len(code) != 4 or not code.isdigit() or code.startswith("0"):
+    for row in data:
+        try:
+            code = str(row[i_code]).strip()
+            if len(code) != 4 or not code.isdigit() or code.startswith("0"):
+                continue
+            o = to_num(row[i_open]); h = to_num(row[i_high]); l = to_num(row[i_low])
+            c = to_num(row[i_close]); v = to_num(row[i_vol])
+            if None in (o, h, l, c, v):
+                continue
+            out[code] = {"Open": o, "High": h, "Low": l, "Close": c, "Volume": v}
+        except Exception:
             continue
-        o = to_num(row.get("OpeningPrice"))
-        h = to_num(row.get("HighestPrice"))
-        l = to_num(row.get("LowestPrice"))
-        c = to_num(row.get("ClosingPrice"))
-        v = to_num(row.get("TradeVolume"))
-        if None in (o, h, l, c, v):
-            continue
-        out[code] = {"Open": o, "High": h, "Low": l, "Close": c, "Volume": v}
-    print(f"證交所最新行情可補 {len(out)} 檔")
+
+    print(f"證交所指定日期 {target_day} 行情：{len(out)} 檔")
+    if "2330" in out:
+        print(f"證交所 2330 {target_day} 收盤：{out['2330']['Close']}")
     return out
 
 
 def patch_latest_twse_day(prices, target_day):
-    """Yahoo 少最新交易日時，用證交所官方資料只補最後一天。"""
+    """Yahoo 少最新交易日時，用『指定日期』證交所官方 OHLCV 補最後一天。"""
     if not target_day:
         return 0
     official = get_twse_latest_ohlcv(target_day)
+    if not official:
+        print(f"⚠️ {target_day} 官方指定日期行情抓不到，不補日期、不推播")
+        return 0
+
     ts = pd.Timestamp(target_day)
     patched = 0
     for code, row in official.items():
@@ -139,12 +201,11 @@ def patch_latest_twse_day(prices, target_day):
             last = pd.Timestamp(df.index[-1]).date()
             if last >= target_day:
                 continue
-            new_row = pd.DataFrame([row], index=[ts])
-            prices[code] = pd.concat([df, new_row])
+            prices[code] = pd.concat([df, pd.DataFrame([row], index=[ts])])
             patched += 1
         except Exception as e:
             print(code, "補最新行情失敗：", e)
-    print(f"已用證交所補上 {target_day}：{patched} 檔")
+    print(f"已真正補上 {target_day} 官方行情：{patched} 檔")
     return patched
 
 
