@@ -107,18 +107,12 @@ def get_universe():
 def get_prices(codes, target_day=None):
     result = {}
     tickers = [c + ".TW" for c in codes]
-    # 明確指定 end=最近交易日+1 天。yfinance 的 end 是不包含當日，
-    # 若只用 period，在台股盤後偶爾會少抓最新一根日 K。
-    dl_kwargs = {"period": "1y"}
-    if target_day:
-        dl_kwargs = {
-            "start": (target_day - dt.timedelta(days=400)).isoformat(),
-            "end": (target_day + dt.timedelta(days=1)).isoformat(),
-        }
+    # 第一版曾成功取得最新交易日，恢復相同的 9mo 批次下載方式。
+    # target_day 只用於後續驗證，不改 Yahoo 的 period 查詢路徑。
     for i in range(0, len(tickers), 100):
         batch = tickers[i:i + 100]
-        data = yf.download(batch, interval="1d", group_by="ticker",
-                           auto_adjust=False, threads=True, progress=False, **dl_kwargs)
+        data = yf.download(batch, period="9mo", interval="1d", group_by="ticker",
+                           auto_adjust=False, threads=True, progress=False)
         for t in batch:
             try:
                 df = data[t][["Open", "High", "Low", "Close", "Volume"]].dropna()
@@ -133,7 +127,7 @@ def get_prices(codes, target_day=None):
 def get_single_price(code):
     for suffix in (".TW", ".TWO"):
         try:
-            df = yf.Ticker(code + suffix).history(period="1y", auto_adjust=False)
+            df = yf.Ticker(code + suffix).history(period="9mo", auto_adjust=False)
             df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
             if len(df):
                 df.index = df.index.tz_localize(None)
