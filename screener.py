@@ -40,6 +40,7 @@ THEMES_FILE = "themes.csv"
 TW = dt.timezone(dt.timedelta(hours=8))
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 SITE_URL = os.getenv("SITE_URL", "")
+MARKET_SUFFIX = {}   # 代號 -> .TW（上市）或 .TWO（上櫃）
 
 
 # ---------------- 小工具 ----------------
@@ -98,11 +99,48 @@ def verdict_of(items):
 
 # ---------------- 抓資料 ----------------
 def get_universe():
+    """建立上市＋上櫃選股池。"""
     names = {}
+    MARKET_SUFFIX.clear()
+
+    # 上市
     for row in get_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"):
-        code = str(row.get("Code", ""))
+        code = str(row.get("Code", "")).strip()
         if len(code) == 4 and code.isdigit() and not code.startswith("0"):
             names[code] = row.get("Name", "")
+            MARKET_SUFFIX[code] = ".TW"
+
+    # 上櫃：櫃買中心每日收盤行情
+    try:
+        today = dt.datetime.now(TW).date()
+        roc = f"{today.year - 1911}/{today.month:02d}/{today.day:02d}"
+        url = ("https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/"
+               f"stk_quote_result.php?l=zh-tw&o=json&d={roc}")
+        j = requests.get(url, headers=HEADERS, timeout=40).json()
+        tables = j.get("tables") or []
+        for table in tables:
+            fields = table.get("fields") or []
+            data = table.get("data") or []
+            if not fields or not data:
+                continue
+            try:
+                i_code = next(i for i, x in enumerate(fields) if "代號" in str(x))
+                i_name = next(i for i, x in enumerate(fields) if "名稱" in str(x))
+            except StopIteration:
+                continue
+            for row in data:
+                try:
+                    code = str(row[i_code]).strip()
+                    name = str(row[i_name]).strip()
+                    if len(code) == 4 and code.isdigit() and not code.startswith("0"):
+                        names[code] = name
+                        MARKET_SUFFIX[code] = ".TWO"
+                except Exception:
+                    continue
+    except Exception as e:
+        print("上櫃股票清單抓取失敗：", e)
+
+    print(f"選股池：上市 {sum(v == '.TW' for v in MARKET_SUFFIX.values())} 檔、上櫃 {sum(v == '.TWO' for v in MARKET_SUFFIX.values())} 檔")
     return names
 
 
@@ -213,26 +251,34 @@ def patch_latest_twse_day(prices, target_day):
 
 def get_prices(codes, target_day=None):
     result = {}
-    tickers = [c + ".TW" for c in codes]
-    # 第一版曾成功取得最新交易日，恢復相同的 9mo 批次下載方式。
-    # target_day 只用於後續驗證，不改 Yahoo 的 period 查詢路徑。
-    for i in range(0, len(tickers), 100):
-        batch = tickers[i:i + 100]
-        data = yf.download(batch, period="9mo", interval="1d", group_by="ticker",
-                           auto_adjust=False, threads=True, progress=False)
-        for t in batch:
-            try:
-                df = data[t][["Open", "High", "Low", "Close", "Volume"]].dropna()
-                if len(df):
-                    result[t[:-3]] = df
-            except Exception:
-                pass
-        time.sleep(2)
+
+    # 上市與上櫃分開抓，避免 .TW / .TWO 混用
+    for suffix in (".TW", ".TWO"):
+        market_codes = [c for c in codes if MARKET_SUFFIX.get(c, ".TW") == suffix]
+        tickers = [c + suffix for c in market_codes]
+        for i in range(0, len(tickers), 100):
+            batch = tickers[i:i + 100]
+            if not batch:
+                continue
+            data = yf.download(batch, period="9mo", interval="1d", group_by="ticker",
+                               auto_adjust=False, threads=True, progress=False)
+            for t in batch:
+                try:
+                    df = data[t][["Open", "High", "Low", "Close", "Volume"]].dropna()
+                    if len(df):
+                        code = t.replace(".TW", "").replace(".TWO", "")
+                        result[code] = df
+                except Exception:
+                    pass
+            time.sleep(2)
     return result
 
 
 def get_single_price(code):
-    for suffix in (".TW", ".TWO"):
+    preferred = MARKET_SUFFIX.get(code)
+    suffixes = [preferred] if preferred else []
+    suffixes += [s for s in (".TW", ".TWO") if s not in suffixes]
+    for suffix in suffixes:
         try:
             df = yf.Ticker(code + suffix).history(period="9mo", auto_adjust=False)
             df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
@@ -1081,7 +1127,7 @@ def send_line(texts):
 def main():
     names = get_universe()
     owner_codes, all_codes = get_holdings()
-    print(f"上市股票 {len(names)} 檔，持股（所有人）{len(all_codes)} 檔")
+    print(f"上市＋上櫃股票 {len(names)} 檔，持股（所有人）{len(all_codes)} 檔")
     target_day = get_latest_twse_trade_day()
     if target_day:
         print(f"證交所最近交易日：{target_day}")
