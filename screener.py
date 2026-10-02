@@ -104,13 +104,21 @@ def get_universe():
     return names
 
 
-def get_prices(codes):
+def get_prices(codes, target_day=None):
     result = {}
     tickers = [c + ".TW" for c in codes]
+    # 明確指定 end=最近交易日+1 天。yfinance 的 end 是不包含當日，
+    # 若只用 period，在台股盤後偶爾會少抓最新一根日 K。
+    dl_kwargs = {"period": "1y"}
+    if target_day:
+        dl_kwargs = {
+            "start": (target_day - dt.timedelta(days=400)).isoformat(),
+            "end": (target_day + dt.timedelta(days=1)).isoformat(),
+        }
     for i in range(0, len(tickers), 100):
         batch = tickers[i:i + 100]
-        data = yf.download(batch, period="1y", interval="1d", group_by="ticker",
-                           auto_adjust=False, threads=True, progress=False)
+        data = yf.download(batch, interval="1d", group_by="ticker",
+                           auto_adjust=False, threads=True, progress=False, **dl_kwargs)
         for t in batch:
             try:
                 df = data[t][["Open", "High", "Low", "Close", "Volume"]].dropna()
@@ -132,6 +140,24 @@ def get_single_price(code):
                 return df
         except Exception:
             pass
+    return None
+
+
+def get_latest_twse_trade_day(max_lookback=10):
+    """從證交所指定日期資料找最近真正的交易日；週末/休市日會自動往前找。"""
+    today = dt.datetime.now(TW).date()
+    for n in range(max_lookback):
+        day = today - dt.timedelta(days=n)
+        # 週末直接略過，減少不必要請求
+        if day.weekday() >= 5:
+            continue
+        try:
+            url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={day:%Y%m%d}&selectType=ALLBUT0999&response=json"
+            j = requests.get(url, headers=HEADERS, timeout=30).json()
+            if j.get("data"):
+                return day
+        except Exception as e:
+            print(f"{day} 交易日確認失敗：", e)
     return None
 
 
@@ -819,7 +845,13 @@ def main():
     names = get_universe()
     owner_codes, all_codes = get_holdings()
     print(f"上市股票 {len(names)} 檔，持股（所有人）{len(all_codes)} 檔")
-    prices = get_prices(list(names))
+    target_day = get_latest_twse_trade_day()
+    if target_day:
+        print(f"證交所最近交易日：{target_day}")
+    else:
+        print("⚠️ 無法確認證交所最近交易日，改用 Yahoo 最新資料")
+
+    prices = get_prices(list(names), target_day)
     if "2330" not in prices:
         sys.exit("抓不到股價資料，結束")
     for code in all_codes:
@@ -831,19 +863,14 @@ def main():
     trade_days = [d.date() for d in prices["2330"].index]
     last_day = trade_days[-1]
     today_tw = dt.datetime.now(TW).date()
-
-    # 以證交所當日全市場資料確認今天是否為交易日。
-    # Yahoo Finance 的台股日 K 有時盤後較晚更新；若 Yahoo 還停在前一交易日，
-    # 不應把舊資料當成今天的盤後報告推播。
-    twse_rows = get_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
-    twse_has_today = any(
-        str(row.get("Code", "")) == "2330" and str(row.get("ClosingPrice", "")).strip()
-        for row in twse_rows
-    )
     is_new_day = last_day == today_tw
-    stale_market_data = twse_has_today and last_day < today_tw
+
+    # 最新行情必須至少到證交所確認的最近交易日。
+    # 週末/國定休市日 target_day 會自然停在前一個交易日，因此手動測試仍可重跑最近報告。
+    stale_market_data = target_day is not None and last_day < target_day
+    print(f"Yahoo 2330 最新日 K：{last_day}")
     if stale_market_data:
-        print(f"⚠️ 證交所已有 {today_tw} 當日資料，但 Yahoo Finance 最新日 K 仍為 {last_day}；本次只更新網站，不推 LINE。")
+        print(f"⚠️ Yahoo Finance 行情落後：證交所最近交易日 {target_day}，Yahoo 只有 {last_day}；停止推播，避免送出舊報告。")
 
     hist = get_chip_history(trade_days[-CHIP_DAYS:])
     today_chips = hist[-1]
