@@ -104,6 +104,50 @@ def get_universe():
     return names
 
 
+def get_twse_latest_ohlcv(target_day):
+    """取得證交所最新交易日的上市股票 OHLCV，供 Yahoo 少最後一天時補齊。"""
+    rows = get_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
+    out = {}
+    for row in rows:
+        code = str(row.get("Code", "")).strip()
+        if len(code) != 4 or not code.isdigit() or code.startswith("0"):
+            continue
+        o = to_num(row.get("OpeningPrice"))
+        h = to_num(row.get("HighestPrice"))
+        l = to_num(row.get("LowestPrice"))
+        c = to_num(row.get("ClosingPrice"))
+        v = to_num(row.get("TradeVolume"))
+        if None in (o, h, l, c, v):
+            continue
+        out[code] = {"Open": o, "High": h, "Low": l, "Close": c, "Volume": v}
+    print(f"證交所最新行情可補 {len(out)} 檔")
+    return out
+
+
+def patch_latest_twse_day(prices, target_day):
+    """Yahoo 少最新交易日時，用證交所官方資料只補最後一天。"""
+    if not target_day:
+        return 0
+    official = get_twse_latest_ohlcv(target_day)
+    ts = pd.Timestamp(target_day)
+    patched = 0
+    for code, row in official.items():
+        df = prices.get(code)
+        if df is None or len(df) == 0:
+            continue
+        try:
+            last = pd.Timestamp(df.index[-1]).date()
+            if last >= target_day:
+                continue
+            new_row = pd.DataFrame([row], index=[ts])
+            prices[code] = pd.concat([df, new_row])
+            patched += 1
+        except Exception as e:
+            print(code, "補最新行情失敗：", e)
+    print(f"已用證交所補上 {target_day}：{patched} 檔")
+    return patched
+
+
 def get_prices(codes, target_day=None):
     result = {}
     tickers = [c + ".TW" for c in codes]
@@ -848,6 +892,11 @@ def main():
     prices = get_prices(list(names), target_day)
     if "2330" not in prices:
         sys.exit("抓不到股價資料，結束")
+
+    # Yahoo 若比證交所慢一天，直接用證交所官方收盤資料補上最後一天。
+    if target_day and prices["2330"].index[-1].date() < target_day:
+        patch_latest_twse_day(prices, target_day)
+
     for code in all_codes:
         if code not in prices:
             df = get_single_price(code)
@@ -862,7 +911,7 @@ def main():
     # 最新行情必須至少到證交所確認的最近交易日。
     # 週末/國定休市日 target_day 會自然停在前一個交易日，因此手動測試仍可重跑最近報告。
     stale_market_data = target_day is not None and last_day < target_day
-    print(f"Yahoo 2330 最新日 K：{last_day}")
+    print(f"最終 2330 最新日 K：{last_day}")
     if stale_market_data:
         print(f"⚠️ Yahoo Finance 行情落後：證交所最近交易日 {target_day}，Yahoo 只有 {last_day}；停止推播，避免送出舊報告。")
 
