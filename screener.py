@@ -31,6 +31,8 @@ NOT_HIGH_GENERAL = 50
 MAX_BIAS = 10                # 離月線最多幾 %
 RSI_HOT = 80                 # RSI 超過算過熱，不列入
 LIST_N = 5                   # 每份名單最多幾檔
+MTF_MIN_SCORE = 50           # 日/週/月多週期技術分數最低門檻（100分）
+TREND_VOL = 1.2              # 非突破型趨勢轉強，至少要有 1.2 倍量
 CHIP_DAYS = 10
 THEMES_FILE = "themes.csv"
 # =======================================================
@@ -500,6 +502,128 @@ def find_levels(df, ma20):
     return (max(below) if below else None), (min(above) if above else None)
 
 
+def resample_ohlcv(df, rule):
+    """把日 K 轉成週 K / 月 K。"""
+    return df.resample(rule).agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+    }).dropna()
+
+
+def timeframe_score(df, I, ms):
+    """多週期技術評分：日線 60%、週線 30%、月線 10%。"""
+    close = float(df["Close"].iloc[-1])
+    rsi = float(I["rsi"].iloc[-1])
+    dscore = 0
+
+    # 日線 60 分：位置、均線、動能、量價
+    if close > I["ma20"].iloc[-1]:
+        dscore += 10
+    if I["ma20"].iloc[-1] > I["ma60"].iloc[-1]:
+        dscore += 8
+    if I["ma20"].iloc[-1] > I["ma20"].iloc[-6]:
+        dscore += 8
+    if I["ma5"].iloc[-1] > I["ma10"].iloc[-1] > I["ma20"].iloc[-1]:
+        dscore += 6
+    if ms["zero"]:
+        dscore += 10
+    elif ms["golden"]:
+        dscore += 7
+    if ms["rising"]:
+        dscore += 5
+    if 50 <= rsi <= 70:
+        dscore += 7
+    elif 45 <= rsi <= 75:
+        dscore += 4
+    vr_now = float(df["Volume"].iloc[-1] / max(I["vma20"].iloc[-2], 1))
+    if vr_now >= 1.5:
+        dscore += 6
+    elif vr_now >= 1.1:
+        dscore += 3
+    dscore = min(60, dscore)
+
+    # 週線 30 分：中期趨勢是否同步轉強
+    wscore = 0
+    try:
+        w = resample_ohlcv(df, "W-FRI")
+        if len(w) >= 14:
+            wc = w["Close"]
+            wma4 = wc.rolling(4).mean()
+            wma12 = wc.rolling(12).mean()
+            wd = wc.ewm(span=12, adjust=False).mean() - wc.ewm(span=26, adjust=False).mean()
+            wdea = wd.ewm(span=9, adjust=False).mean()
+            wh = wd - wdea
+            if wc.iloc[-1] > wma4.iloc[-1]:
+                wscore += 8
+            if wma4.iloc[-1] > wma12.iloc[-1]:
+                wscore += 8
+            if wma4.iloc[-1] > wma4.iloc[-3]:
+                wscore += 6
+            if wh.iloc[-1] > 0:
+                wscore += 5
+            if len(wh) >= 3 and wh.iloc[-1] > wh.iloc[-2]:
+                wscore += 3
+    except Exception:
+        pass
+    wscore = min(30, wscore)
+
+    # 月線 10 分：只當長期背景，不拿來抓進場點
+    mscore = 0
+    try:
+        m = resample_ohlcv(df, "ME")
+        if len(m) >= 4:
+            mc = m["Close"]
+            mma3 = mc.rolling(3).mean()
+            if mc.iloc[-1] > mma3.iloc[-1]:
+                mscore += 5
+            if mma3.iloc[-1] > mma3.iloc[-2]:
+                mscore += 5
+    except Exception:
+        try:
+            m = resample_ohlcv(df, "M")
+            if len(m) >= 4:
+                mc = m["Close"]
+                mma3 = mc.rolling(3).mean()
+                if mc.iloc[-1] > mma3.iloc[-1]:
+                    mscore += 5
+                if mma3.iloc[-1] > mma3.iloc[-2]:
+                    mscore += 5
+        except Exception:
+            pass
+
+    total = int(dscore + wscore + mscore)
+    if dscore >= 42 and wscore >= 20:
+        label = "🔥🌊 短中波段皆可"
+    elif wscore >= 22 and mscore >= 5:
+        label = "🌊 大波段潛力"
+    elif dscore >= 42:
+        label = "🔥 短波段轉強"
+    else:
+        label = "📈 偏多觀察"
+    return {"total": total, "daily": int(dscore), "weekly": int(wscore),
+            "monthly": int(mscore), "label": label, "vr": r2(vr_now)}
+
+
+def detect_trend_setup(df, I, support):
+    """不是標準突破/拉回時，補抓『剛轉強但尚未噴遠』的多頭機會。"""
+    close = float(df["Close"].iloc[-1])
+    ma20 = float(I["ma20"].iloc[-1])
+    ma60 = float(I["ma60"].iloc[-1])
+    rsi = float(I["rsi"].iloc[-1])
+    vr = float(df["Volume"].iloc[-1] / max(I["vma20"].iloc[-2], 1))
+    bias = (close / ma20 - 1) * 100
+    if not (close > ma20 and ma20 >= ma60 * 0.98):
+        return None
+    if not (I["ma20"].iloc[-1] > I["ma20"].iloc[-6]):
+        return None
+    if not (48 <= rsi <= 72) or bias > 8 or vr < TREND_VOL:
+        return None
+    # 最近幾天至少有明顯轉強，避免只是在高檔橫盤
+    if close <= df["Close"].iloc[-6:-1].mean():
+        return None
+    return {"kind": "trend", "vr": vr, "day": 1,
+            "days": 20, "top": close, "bot": float(support or ma20), "rng": r2(bias)}
+
+
 # ---------------- 型態判斷 ----------------
 def find_box(df, e):
     """第 e 天之前的盤整箱型（找整理最久的）"""
@@ -579,6 +703,9 @@ def tech_items_pick(pat, I, ms, rsi):
     elif k == "high20":
         it.append(item("info", "型態", f"帶量突破 20 日高點 {pat['top']:,.2f}"))
         pts += 1
+    elif k == "trend":
+        it.append(item("good", "型態", "日線剛轉強、量能開始放大，尚未明顯噴遠"))
+        pts += 2
     else:
         it.append(item("good", "型態", "多頭趨勢中拉回支撐，量縮止跌"))
         pts += 3
@@ -778,6 +905,14 @@ def make_plan(pat, close, support, resistance, df):
             target, tnote = resistance, "前波壓力"
         else:
             target, tnote = float(df["High"].iloc[-20:].max()), "近期高點"
+    elif pat["kind"] == "trend":
+        base = support or float(df["Close"].rolling(20).mean().iloc[-1])
+        lo, hi = close * 0.99, close * 1.01
+        stop = base * 0.97
+        if resistance and resistance > close * 1.03:
+            target, tnote = resistance, "前波壓力"
+        else:
+            target, tnote = close * 1.10, "現價 +10%"
     else:
         top, bot = pat["top"], pat["bot"]
         lo, hi = top, top * 1.02
@@ -844,7 +979,7 @@ def rotation(prices, last_day, funds, themes, today_chips):
 FICON = {"good": "✅", "neutral": "➖", "bad": "⚠️"}
 VICON = {"hold": "✅", "watch": "⚠️", "exit": "🚨"}
 VWORD = {"hold": "續抱", "watch": "留意", "exit": "該檢討"}
-KIND = {"tangle": "🔥", "box": "🚀", "high20": "🚀", "pullback": "🔄"}
+KIND = {"tangle": "🔥", "box": "🚀", "high20": "🚀", "pullback": "🔄", "trend": "📈"}
 
 
 def facets_line(fc):
@@ -863,9 +998,12 @@ def pick_text(n, p):
     th = "、".join(d.get("themes", [])[:2]) or d.get("industry") or ""
     L = [f"{n}. {KIND[p['kind']]}{p['code']} {d['name']}｜{th}"]
     sub = ""
-    if p["kind"] != "pullback":
+    if p["kind"] not in ("pullback", "trend"):
         sub = f"　突破第 {p['day']} 天"
     L.append(f"收 {d['close']:,.2f}（{d['chg']:+.1f}%）{sub}")
+    mtf = d.get("mtf") or {}
+    if mtf:
+        L.append(f"{mtf.get('label','')}｜多週期 {mtf.get('total',0)}/100（日{mtf.get('daily',0)}／週{mtf.get('weekly',0)}／月{mtf.get('monthly',0)}）")
     L.append(facets_line(d["facets"]))
     L.append(f"進場 {pl['lo']:,.2f}～{pl['hi']:,.2f}｜停損 {pl['stop']:,.2f}｜30天停利 {pl['target']:,.2f}（{pl['tnote']}）")
     L.append(f"→ {pl['status']}" + (f"，報酬風險比 {pl['rr']:.1f}" if pl.get("rr") else ""))
@@ -912,9 +1050,9 @@ def build_report(day, rot, lists, holdings=None, outflow_names=()):
                 H.append("　" + "；".join(alerts[:3]))
         msgs.append("\n".join(H))
 
-    titles = {"tangle": "🔥 糾結突破（均線糾結＋盤整＋帶量剛突破）",
-              "general": "🚀 一般突破",
-              "pullback": "🔄 拉回支撐（多頭趨勢中回檔、量縮止跌）"}
+    titles = {"tangle": "🔥 起漲前段（均線糾結／箱型帶量剛突破）",
+              "general": "📈 做多機會（突破／趨勢剛轉強）",
+              "pullback": "🔄 多頭拉回再起（量縮守支撐）"}
     for key in ("tangle", "general", "pullback"):
         items = lists[key]
         T = [titles[key], ""]
@@ -1014,12 +1152,14 @@ def main():
             fi, fvals = fund_items(f, close)
             ci = chip_items(code, hist, chips_ok, H["big"], H["margin"], pc5)
             ti = tech_items_hold(df, I, ms, support, resistance)
+            mtf = timeframe_score(df, I, ms)
             d = {
                 "name": names.get(code, ""), "date": str(df.index[-1].date()),
                 "close": r2(close), "chg": r2((close / c.iloc[-2] - 1) * 100),
                 "industry": (f or {}).get("industry", ""), "themes": themes.get(code, []),
                 "ma20": r2(ma20), "ma60": r2(I["ma60"].iloc[-1]), "rsi": r2(I["rsi"].iloc[-1]),
                 "support": r2(support), "resistance": r2(resistance),
+                "mtf": mtf,
                 "closes": [r2(x) for x in c.iloc[-60:]],
                 "ma20s": [r2(x) for x in I["ma20"].iloc[-60:]],
                 "ma60s": [r2(x) for x in I["ma60"].iloc[-60:]],
@@ -1054,6 +1194,11 @@ def main():
             if not pat:
                 pat = detect_pullback(df, I, support)
             if not pat:
+                pat = detect_trend_setup(df, I, support)
+            if not pat:
+                continue
+            # 多週期技術分數太低，不列入做多名單。
+            if mtf["total"] < MTF_MIN_SCORE:
                 continue
             tpi, tpts = tech_items_pick(pat, I, ms, rsi)
             cands.append((code, pat, tpi, tpts))
@@ -1064,7 +1209,11 @@ def main():
     lists = {"tangle": [], "general": [], "pullback": []}
     for code, pat, tpi, tpts in cands:
         d = details[code]
-        score = tpts + facet_pts(d["facets"]["chip"]["items"]) + facet_pts(d["facets"]["fund"]["items"])
+        # 技術面為主：多週期技術分數占最大權重；籌碼其次；基本面只做輔助。
+        tech_score = d["mtf"]["total"] * 0.70 + tpts * 2.0
+        chip_score = facet_pts(d["facets"]["chip"]["items"]) * 3.0
+        fund_score = facet_pts(d["facets"]["fund"]["items"]) * 1.0
+        score = tech_score + chip_score + fund_score
         key = "tangle" if pat["kind"] == "tangle" else "pullback" if pat["kind"] == "pullback" else "general"
         lists[key].append({"code": code, "kind": pat["kind"], "day": pat.get("day"),
                            "score": round(score, 1), "pat": pat, "tpi": tpi})
@@ -1118,7 +1267,7 @@ def main():
     if os.path.exists("index.html"):
         with open("index.html", encoding="utf-8") as a, open("site/index.html", "w", encoding="utf-8") as b:
             b.write(a.read())
-    print(f"網站資料：{len(details)} 檔；名單 糾結 {len(lists['tangle'])}、一般 {len(lists['general'])}、拉回 {len(lists['pullback'])}")
+    print(f"網站資料：{len(details)} 檔；名單 起漲 {len(lists['tangle'])}、做多 {len(lists['general'])}、拉回 {len(lists['pullback'])}")
 
     # FORCE 只允許在休市日重跑「最近交易日」資料；若證交所已進入新交易日但
     # Yahoo Finance 尚未更新，手動 Run workflow 也禁止把舊資料推成今日盤後報告。
