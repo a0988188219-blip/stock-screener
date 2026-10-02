@@ -1051,7 +1051,10 @@ def pick_text(n, p):
     if mtf:
         L.append(f"{mtf.get('label','')}｜多週期 {mtf.get('total',0)}/100（日{mtf.get('daily',0)}／週{mtf.get('weekly',0)}／月{mtf.get('monthly',0)}）")
     L.append(facets_line(d["facets"]))
-    L.append(f"進場 {pl['lo']:,.2f}～{pl['hi']:,.2f}｜停損 {pl['stop']:,.2f}｜30天停利 {pl['target']:,.2f}（{pl['tnote']}）")
+    support_txt = f"{d['support']:,.2f}" if d.get("support") is not None else "暫無明顯支撐"
+    resistance_txt = f"{d['resistance']:,.2f}" if d.get("resistance") is not None else "無明顯前高壓力"
+    L.append(f"支撐 {support_txt}｜壓力 {resistance_txt}")
+    L.append(f"建議進場 {pl['lo']:,.2f}～{pl['hi']:,.2f}｜停損 {pl['stop']:,.2f}｜30天停利 {pl['target']:,.2f}（{pl['tnote']}）")
     L.append(f"→ {pl['status']}" + (f"，報酬風險比 {pl['rr']:.1f}" if pl.get("rr") else ""))
     fv = d["facets"]["fund"].get("vals") or {}
     extra = [f"RSI {d['rsi']:.0f}"]
