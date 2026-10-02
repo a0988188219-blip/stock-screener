@@ -36,3 +36,12 @@ jobs:
           path: site
       - id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: 群發盤後精選給 LINE 好友
+        if: github.event_name == 'schedule'
+        run: |
+          sleep 15
+          curl -sS -X POST "${WORKER_URL}/broadcast?key=${SYNC_KEY}"
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          SYNC_KEY: ${{ secrets.SYNC_KEY }}
