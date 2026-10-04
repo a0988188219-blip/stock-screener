@@ -7,7 +7,9 @@
 - 5 日線上穿 10 日線（日線均線黃金交叉）是加分，不是唯一必要條件
 - 修正上櫃股票 .TWO 代號被誤轉成 6548O／8155O 的問題
 - 上櫃股加入櫃買中心三大法人籌碼資料
+- MACD 只認最近一次交叉，避免黃金交叉後仍殘留死亡交叉
 """
+import io
 import screener
 
 # 股價不設上下限
@@ -33,6 +35,40 @@ def get_prices_v2(codes, target_day=None):
 
 
 screener.get_prices = get_prices_v2
+
+
+# ---- MACD：只認最近一次交叉 ----
+def macd_state_v2(c, I):
+    dif = I["dif"].values
+    dea = I["dea"].values
+    h = I["hist"].values
+    n = len(dif)
+    s = {"golden": False, "zero": False, "dead": False, "rising": False, "div": False}
+
+    # 從最新往回找，第一個交叉就是目前真正有效的最近一次交叉。
+    for i in range(n - 1, max(0, n - 10), -1):
+        if i - 1 < 0:
+            break
+        if dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]:
+            s["golden"] = True
+            s["zero"] = abs(dif[i]) / max(abs(float(c.iloc[i])), 1e-9) <= 0.015
+            break
+        if dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]:
+            s["dead"] = True
+            break
+
+    s["rising"] = bool(n >= 3 and h[-1] > h[-2] > h[-3] and h[-1] > 0)
+
+    if n >= 60:
+        cl = c.values
+        if (cl[-10:].max() >= cl[-60:].max()
+                and cl[-10:].max() > cl[-60:-10].max()
+                and dif[-10:].max() < dif[-60:-10].max()):
+            s["div"] = True
+    return s
+
+
+screener.macd_state = macd_state_v2
 
 
 def recent_ma_golden(I, lookback=5):
@@ -131,12 +167,6 @@ def _parse_tpex_table(fields, data):
         i_trust = _find_col(fields, ("投信", "淨買"))
     i_total = _find_col(fields, ("三大法人", "合計"))
 
-    dealer_cols = []
-    for i, x in enumerate(fields):
-        s = str(x)
-        if "自營商" in s and ("買賣超" in s or "淨買" in s) and "外資" not in s:
-            dealer_cols.append(i)
-
     if i_code is None or i_foreign is None or i_trust is None:
         return {}
 
@@ -148,10 +178,10 @@ def _parse_tpex_table(fields, data):
                 continue
             foreign = screener.to_num(row[i_foreign]) or 0
             trust = screener.to_num(row[i_trust]) or 0
-            dealer = sum((screener.to_num(row[i]) or 0) for i in dealer_cols)
             total = screener.to_num(row[i_total]) if i_total is not None else None
+            dealer = 0 if total is None else total - foreign - trust
             if total is None:
-                total = foreign + trust + dealer
+                total = foreign + trust
             out[code] = {
                 "foreign": foreign / 1000,
                 "trust": trust / 1000,
@@ -163,6 +193,75 @@ def _parse_tpex_table(fields, data):
     return out
 
 
+def _flat_cols(df):
+    cols = []
+    for col in df.columns:
+        parts = col if isinstance(col, tuple) else (col,)
+        clean = []
+        for x in parts:
+            s = str(x).strip()
+            if not s or s.lower() == "nan" or "Unnamed" in s:
+                continue
+            if not clean or clean[-1] != s:
+                clean.append(s)
+        cols.append(" ".join(clean))
+    return cols
+
+
+def _parse_tpex_html(text):
+    try:
+        tables = screener.pd.read_html(io.StringIO(text))
+    except Exception:
+        return {}
+
+    for df in tables:
+        if df.empty:
+            continue
+        fields = _flat_cols(df)
+        joined = "|".join(fields)
+        if "代號" not in joined or "投信" not in joined or "三大法人" not in joined:
+            continue
+
+        i_code = _find_col(fields, ("代號",))
+        foreign_candidates = [
+            i for i, s in enumerate(fields)
+            if "外資及陸資" in s and "買賣超" in s and "自營商" not in s
+        ]
+        # 優先用「不含外資自營商」欄，和上市 T86 的外資定義較一致。
+        i_foreign = next((i for i in foreign_candidates if "不含" in fields[i]), None)
+        if i_foreign is None and foreign_candidates:
+            i_foreign = foreign_candidates[0]
+
+        i_trust = _find_col(fields, ("投信", "買賣超"))
+        i_total = _find_col(fields, ("三大法人", "買賣超"))
+        if i_total is None:
+            i_total = _find_col(fields, ("三大法人", "合計"))
+        if None in (i_code, i_foreign, i_trust, i_total):
+            continue
+
+        out = {}
+        for row in df.itertuples(index=False, name=None):
+            try:
+                code = str(row[i_code]).strip()
+                if len(code) != 4 or not code.isdigit() or code.startswith("0"):
+                    continue
+                foreign = screener.to_num(row[i_foreign]) or 0
+                trust = screener.to_num(row[i_trust]) or 0
+                total = screener.to_num(row[i_total]) or 0
+                dealer = total - foreign - trust
+                out[code] = {
+                    "foreign": foreign / 1000,
+                    "trust": trust / 1000,
+                    "dealer": dealer / 1000,
+                    "total": total / 1000,
+                }
+            except Exception:
+                continue
+        if out:
+            return out
+    return {}
+
+
 def get_tpex_chips_one(date_str):
     try:
         y, m, d = int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8])
@@ -170,29 +269,34 @@ def get_tpex_chips_one(date_str):
         return {}
 
     roc = f"{y - 1911}/{m:02d}/{d:02d}"
-    greg = f"{y:04d}/{m:02d}/{d:02d}"
-    urls = [
-        ("https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php", {
-            "l": "zh-tw", "o": "json", "se": "EW", "t": "D", "d": roc,
-        }),
-        ("https://www.tpex.org.tw/www/zh-tw/insti/daily", {
-            "date": greg, "type": "Daily", "sect": "EW", "response": "json",
-        }),
-    ]
+    base = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
 
-    for url, params in urls:
-        try:
-            j = screener.requests.get(url, params=params, headers=screener.HEADERS, timeout=30).json()
-            tables = j.get("tables") or []
-            if isinstance(j.get("fields"), list) and isinstance(j.get("data"), list):
-                tables = [{"fields": j.get("fields"), "data": j.get("data")}] + list(tables)
-            for table in tables:
-                parsed = _parse_tpex_table(table.get("fields") or [], table.get("data") or [])
-                if parsed:
-                    print(f"櫃買中心 {date_str} 法人資料：{len(parsed)} 檔")
-                    return parsed
-        except Exception as e:
-            print(f"{date_str} 上櫃法人資料抓取失敗：", e)
+    # 先試 JSON；櫃買中心若回 HTML/非 JSON，再改用官方 HTML 表格解析。
+    try:
+        r = screener.requests.get(base, params={"l": "zh-tw", "o": "json", "se": "EW", "t": "D", "d": roc},
+                                  headers=screener.HEADERS, timeout=30)
+        j = r.json()
+        tables = j.get("tables") or []
+        if isinstance(j.get("fields"), list) and isinstance(j.get("data"), list):
+            tables = [{"fields": j.get("fields"), "data": j.get("data")}] + list(tables)
+        for table in tables:
+            parsed = _parse_tpex_table(table.get("fields") or [], table.get("data") or [])
+            if parsed:
+                print(f"櫃買中心 {date_str} 法人資料(JSON)：{len(parsed)} 檔")
+                return parsed
+    except Exception:
+        pass
+
+    try:
+        r = screener.requests.get(base, params={"l": "zh-tw", "o": "htm", "se": "EW", "t": "D", "d": roc},
+                                  headers=screener.HEADERS, timeout=30)
+        parsed = _parse_tpex_html(r.text)
+        if parsed:
+            print(f"櫃買中心 {date_str} 法人資料(HTML)：{len(parsed)} 檔")
+            return parsed
+        print(f"{date_str} 上櫃法人資料：官方頁有回應，但未解析出明細")
+    except Exception as e:
+        print(f"{date_str} 上櫃法人資料抓取失敗：", e)
     return {}
 
 
