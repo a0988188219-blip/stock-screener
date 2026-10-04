@@ -5,12 +5,35 @@
 - 保留流動性門檻
 - 優先找站上月線／季線、量價轉強、結構乾淨的做多股
 - 5 日線上穿 10 日線（日線均線黃金交叉）是加分，不是唯一必要條件
+- 修正上櫃股票 .TWO 代號被誤轉成 6548O／8155O 的問題
 """
 import screener
 
 # 股價不設上下限
 screener.MIN_PRICE = float("-inf")
 screener.MAX_PRICE = float("inf")
+
+
+# ---- 修正上櫃股票代號 ----
+# 原本 screener.get_prices() 先 replace('.TW')，會把 8155.TWO 變成 8155O。
+# 在正式入口把結果統一校正回真正的四碼股票代號，讓選股、網站、LINE 查詢都用同一套代號。
+_orig_get_prices = screener.get_prices
+
+
+def get_prices_v2(codes, target_day=None):
+    raw = _orig_get_prices(codes, target_day)
+    fixed = {}
+    for code, df in raw.items():
+        real_code = code
+        if len(code) == 5 and code.endswith("O"):
+            candidate = code[:-1]
+            if screener.MARKET_SUFFIX.get(candidate) == ".TWO":
+                real_code = candidate
+        fixed[real_code] = df
+    return fixed
+
+
+screener.get_prices = get_prices_v2
 
 
 def recent_ma_golden(I, lookback=5):
